@@ -81,7 +81,7 @@ dependencies = [
     "megatron-core[dev,mlm]>=0.15.0a0,<0.17.0",
     "qwen-vl-utils",
     "transformer-engine[pytorch]>=2.9.0a0,<2.10.0",
-    "mamba-ssm",
+    # "mamba-ssm", # TODO make it optional dependency
     "nvidia-resiliency-ext",
     "causal-conv1d",
     "flash-linear-attention",
