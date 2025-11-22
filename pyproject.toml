@@ -79,14 +79,14 @@ dependencies = [
     "tqdm>=4.67.1",
     "hydra-core>1.3,<=1.3.2",
     "megatron-core[dev,mlm]>=0.15.0a0,<0.17.0",
-    "qwen-vl-utils",
+    # "qwen-vl-utils", # TODO make it optional dependency
     "transformer-engine[pytorch]>=2.9.0a0,<2.10.0",
     # "mamba-ssm", # TODO make it optional dependency
     "nvidia-resiliency-ext",
-    "causal-conv1d",
-    "flash-linear-attention",
-    "timm",
-    "open-clip-torch>=3.2.0",
+    # "causal-conv1d", # TODO make it optional dependency
+    # "flash-linear-attention", # TODO make it optional dependency
+    # "timm", # TODO make it optional dependency
+    # "open-clip-torch>=3.2.0", # TODO make it optional dependency
 ]
 
 
