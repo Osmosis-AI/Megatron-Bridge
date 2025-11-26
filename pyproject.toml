@@ -106,11 +106,11 @@ no-build-isolation-package = [
 ]
 prerelease = "allow"
 override-dependencies = [
-    "nvidia-modelopt[torch]>=0.37.0",
+    # "nvidia-modelopt[torch]>=0.37.0", # TODO make it optional dependency
     "torch; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
-    "transformer-engine[pytorch]>=2.9.0a0,<2.10.0",
+    # "transformer-engine[pytorch]>=2.9.0a0,<2.10.0", # TODO make it optional dependency
 ]
 
 # uv.sources allows us to override dependencies with VCS commits.
