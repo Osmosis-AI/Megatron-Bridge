@@ -218,6 +218,7 @@ class Qwen3VLMoEBridge(MegatronModelBridge):
         >>> provider = bridge.to_megatron_provider()
     """
 
+    # copied from https://github.com/fzyzcjy/Megatron-Bridge/blob/6b1b80cdd3f5387e378545399287bf4a21a56fe0/src/megatron/bridge/models/gpt_oss/gpt_oss_bridge.py#L54
     def __init__(self):
         super().__init__()
         self.hf_weights_cache = {}
@@ -288,6 +289,7 @@ class Qwen3VLMoEBridge(MegatronModelBridge):
 
         return provider
 
+    # adapted from https://github.com/fzyzcjy/Megatron-Bridge/blob/6b1b80cdd3f5387e378545399287bf4a21a56fe0/src/megatron/bridge/models/gpt_oss/gpt_oss_bridge.py#L109
     def maybe_modify_converted_hf_weight(
         self, task: WeightConversionTask, converted_weights_dict: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
