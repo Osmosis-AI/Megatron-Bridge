@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from typing import Dict, Union
 
 import torch
 import torch.nn as nn
+from megatron.core import parallel_state
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLMoeForConditionalGeneration
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
-from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     GatedMLPMapping,
@@ -216,6 +218,11 @@ class Qwen3VLMoEBridge(MegatronModelBridge):
         >>> provider = bridge.to_megatron_provider()
     """
 
+    # copied from https://github.com/fzyzcjy/Megatron-Bridge/blob/6b1b80cdd3f5387e378545399287bf4a21a56fe0/src/megatron/bridge/models/gpt_oss/gpt_oss_bridge.py#L54
+    def __init__(self):
+        super().__init__()
+        self.hf_weights_cache = {}
+
     def provider_bridge(self, hf_pretrained: PreTrainedVLM) -> Qwen3VLMoEModelProvider:
         """
         Create a Qwen3VLMoEModelProvider from a HuggingFace pretrained MoE model.
@@ -281,6 +288,49 @@ class Qwen3VLMoEBridge(MegatronModelBridge):
         )
 
         return provider
+
+    # adapted from https://github.com/fzyzcjy/Megatron-Bridge/blob/6b1b80cdd3f5387e378545399287bf4a21a56fe0/src/megatron/bridge/models/gpt_oss/gpt_oss_bridge.py#L109
+    def maybe_modify_converted_hf_weight(
+        self, task: WeightConversionTask, converted_weights_dict: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        num_experts = self.hf_config.text_config.num_experts
+        ep_size = parallel_state.get_expert_model_parallel_world_size()
+        experts_per_rank = num_experts // ep_size
+
+        try:
+            local_expert_number = extract_expert_number_from_param(task.param_name) % experts_per_rank
+        except ValueError:
+            # not an expert weight
+            return converted_weights_dict
+
+        assert len(converted_weights_dict) == 1, (
+            f"There should be only one key in the converted_weights_dict, got keys: {converted_weights_dict.keys()}"
+        )
+        for key, value in converted_weights_dict.items():
+            if key not in self.hf_weights_cache:
+                self.hf_weights_cache[key] = {}
+
+            # we end up with ep_size many weights to add to the cache
+            # unpack the weights and re-index
+            if ep_size == 1:
+                self.hf_weights_cache[key][local_expert_number] = value
+            else:
+                assert value.shape[0] == ep_size
+                for i, exp_val in enumerate(value):
+                    global_expert_number = local_expert_number + (i * experts_per_rank)
+                    self.hf_weights_cache[key][global_expert_number] = exp_val
+            if len(self.hf_weights_cache[key]) == num_experts:
+                logging.debug(f"All experts are loaded for {key}")
+                # all experts are loaded
+                merged_hf_weights = torch.cat(
+                    [self.hf_weights_cache[key][i].unsqueeze(0) for i in range(num_experts)], dim=0
+                )
+                del self.hf_weights_cache[key]
+                return {key: merged_hf_weights}
+            else:
+                # not all experts are loaded yet, return empty dict
+                logging.debug(f"{len(self.hf_weights_cache[key])}/{num_experts} experts are loaded for {key}")
+                return {}
 
     def mapping_registry(self) -> MegatronMappingRegistry:
         """
