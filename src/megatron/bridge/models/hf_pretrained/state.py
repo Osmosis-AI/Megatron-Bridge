@@ -714,7 +714,7 @@ class SafeTensorsStateSource(StateSource):
         buffered_tensors = {}
         if not key_to_filename_map:
             for item in generator:
-                name, tensor = item.name, item.tensor
+                name, tensor = item.param_name, item.weight
                 buffered_tensors[name] = tensor
             if buffered_tensors:
                 save_file(buffered_tensors, output_path / "model.safetensors")
@@ -729,7 +729,7 @@ class SafeTensorsStateSource(StateSource):
         all_saved_keys = set()
 
         for item in generator:
-            name, tensor = item.name, item.tensor
+            name, tensor = item.param_name, item.weight
 
             all_yielded_keys.add(name)
             if name not in all_expected_keys:
