@@ -370,7 +370,6 @@ class Qwen3VLMoEBridge(MegatronModelBridge):
         self,
         task: WeightConversionTask,
         converted_weights_dict: Dict[str, torch.Tensor],
-        hf_state_dict: Mapping[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         num_experts = self.hf_config.text_config.num_experts
         ep_size = parallel_state.get_expert_model_parallel_world_size()
