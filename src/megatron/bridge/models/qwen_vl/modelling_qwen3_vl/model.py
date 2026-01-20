@@ -267,18 +267,46 @@ class Qwen3VLModel(MegatronModule):
                 combined_embeddings = combined_embeddings.contiguous()
         else:
             combined_embeddings = None
-
+        cu_seqlens_padded = None
+        if packed_seq_params is not None:
+            if packed_seq_params.cu_seqlens_q_padded is not None:
+                cu_seqlens_padded = packed_seq_params.cu_seqlens_q_padded
+            else:
+                cu_seqlens_padded = packed_seq_params.cu_seqlens_q
         if position_ids is None:
+            input_ids_for_rope_index = input_ids
+            if cu_seqlens_padded is not None:
+                def thd_to_bshd(packed_values: torch.Tensor, cu_seqlens: torch.Tensor):
+                    seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+                    max_seq_len = seqlens.max()
+                    bs = len(cu_seqlens) - 1
+                    results = packed_values.new_zeros(size=(bs, max_seq_len, *packed_values.shape[2:]))
+                    for i, seqlen in enumerate(seqlens):
+                        results[i, :seqlen] = packed_values[0, cu_seqlens[i]: cu_seqlens[i] + seqlen]
+                    return results
+
+                def bshd_to_thd(unpacked_values: torch.Tensor, cu_seqlens: torch.Tensor):
+                    seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+                    total_len = cu_seqlens[-1]
+                    results = unpacked_values.new_zeros(size=(1, total_len, *unpacked_values.shape[2:]))
+                    for i, seqlen in enumerate(seqlens):
+                        results[0, cu_seqlens[i]: cu_seqlens[i] + seqlen] = unpacked_values[i, :seqlen]
+                    return results
+
+                input_ids_for_rope_index = thd_to_bshd(input_ids, cu_seqlens_padded)
+
             position_ids, _ = get_rope_index(
                 self.config.spatial_merge_size,
                 self.image_token_id,
                 self.video_token_id,
                 self.vision_start_token_id,
-                input_ids,
+                input_ids_for_rope_index,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
                 attention_mask=attention_mask,
             )
+            if cu_seqlens_padded is not None:
+                position_ids = bshd_to_thd(position_ids.permute(1, 2, 0), cu_seqlens_padded).permute(2, 0, 1)
 
         visual_pos_masks = image_mask
         deepstack_visual_embeds = deepstack_feature_lists
