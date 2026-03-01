@@ -36,9 +36,10 @@ from typing import Any, Callable, List, Optional
 
 import transformers
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
-from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-    get_transformer_block_with_experimental_attention_variant_spec,
-)
+# from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+#     get_transformer_block_with_experimental_attention_variant_spec,
+# )
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from packaging.version import Version as PkgVersion
@@ -63,6 +64,12 @@ from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.attention import Qwen3VLSelfAttention
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
 
+try:
+    import transformer_engine  # type: ignore  # noqa: F401
+
+    HAVE_TE = True
+except (ImportError, ModuleNotFoundError):
+    HAVE_TE = False
 
 def _check_qwen3_5_available() -> None:
     """Raise a clear error if transformers doesn't have qwen3_5 (dense) support."""
@@ -105,8 +112,11 @@ class Qwen35VLModelProvider(GPTModelProvider):
     # =========================================================================
     # Hybrid Architecture (Qwen3-Next style)
     # =========================================================================
+    # transformer_layer_spec: ModuleSpec | Callable[["GPTModelProvider"], ModuleSpec] = (
+    #     get_transformer_block_with_experimental_attention_variant_spec
+    # )
     transformer_layer_spec: ModuleSpec | Callable[["GPTModelProvider"], ModuleSpec] = (
-        get_transformer_block_with_experimental_attention_variant_spec
+        get_gpt_decoder_block_spec
     )
     layernorm_zero_centered_gamma: bool = True
     attention_output_gate: bool = True
@@ -190,9 +200,14 @@ class Qwen35VLModelProvider(GPTModelProvider):
         language_transformer_config = self
         hf_vision_config = self.vision_config
 
-        block_spec = get_transformer_block_with_experimental_attention_variant_spec(
+        # block_spec = get_transformer_block_with_experimental_attention_variant_spec(
+        #     language_transformer_config,
+        #     vp_stage=vp_stage,
+        # )
+        block_spec = get_gpt_decoder_block_spec(
             language_transformer_config,
             vp_stage=vp_stage,
+            use_transformer_engine=HAVE_TE,
         )
         _patch_standard_attention_specs(block_spec, Qwen3VLSelfAttention)
 
@@ -202,7 +217,6 @@ class Qwen35VLModelProvider(GPTModelProvider):
             vision_transformer_config=hf_vision_config,
             pre_process=pre_process,
             post_process=post_process,
-            pg_collection=self._pg_collection,
         )
 
         if self.freeze_language_model or self.freeze_vision_model or self.freeze_vision_projection:
@@ -244,8 +258,11 @@ class Qwen35VLMoEModelProvider(GPTModelProvider):
     # =========================================================================
     # Hybrid Architecture (Qwen3-Next style)
     # =========================================================================
+    # transformer_layer_spec: ModuleSpec | Callable[["GPTModelProvider"], ModuleSpec] = (
+    #     get_transformer_block_with_experimental_attention_variant_spec
+    # )
     transformer_layer_spec: ModuleSpec | Callable[["GPTModelProvider"], ModuleSpec] = (
-        get_transformer_block_with_experimental_attention_variant_spec
+        get_gpt_decoder_block_spec
     )
     layernorm_zero_centered_gamma: bool = True
     attention_output_gate: bool = True
@@ -374,32 +391,26 @@ class Qwen35VLMoEModelProvider(GPTModelProvider):
         language_transformer_config = self
         hf_vision_config = self.vision_config
 
-        # Build hybrid block spec: produces TransformerBlockSubmodules with
-        # per-layer specs (GDN layers get GatedDeltaNet, attention layers get
-        # standard SelfAttention + MoE).
-        block_spec = get_transformer_block_with_experimental_attention_variant_spec(
+        # block_spec = get_transformer_block_with_experimental_attention_variant_spec(
+        #     language_transformer_config,
+        #     vp_stage=vp_stage,
+        # )
+        block_spec = get_gpt_decoder_block_spec(
             language_transformer_config,
             vp_stage=vp_stage,
+            use_transformer_engine=HAVE_TE,
         )
 
         # Selectively patch only the standard (full) attention layer specs
         # with Qwen3VLSelfAttention for mRoPE support. GDN layers are left as-is.
         _patch_standard_attention_specs(block_spec, Qwen3VLSelfAttention)
 
-        # Qwen3VLModel expects a single ModuleSpec and does a uniform patch on
-        # line 87. We pass the block spec instead – GPTModel/TransformerBlock
-        # already handles TransformerBlockSubmodules natively. The uniform patch
-        # line will fail on a TransformerBlockSubmodules, so we bypass it by
-        # passing the spec through and letting the model ignore the single-spec
-        # assumption. We pass the block_spec as the layer spec; Qwen3VLGPTModel
-        # forwards it to TransformerBlock which handles both types.
         model = Qwen3VLModel(
             language_transformer_config=language_transformer_config,
             language_transformer_layer_spec=block_spec,
             vision_transformer_config=hf_vision_config,
             pre_process=pre_process,
             post_process=post_process,
-            pg_collection=self._pg_collection,
         )
 
         # Apply freeze options if any are enabled for fine-tuning
