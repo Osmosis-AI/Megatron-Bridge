@@ -53,6 +53,14 @@ from megatron.bridge.models.hf_pretrained.utils import is_safe_repo
 HF_MODEL_ID = "meta-llama/Llama-3.2-1B"
 console = Console()
 
+# Parameters where Megatron and HF may use different dtypes.
+# These are compared in float32 to avoid false mismatches.
+IGNORE_PRECISION_PARAMS = [
+    "e_score_correction_bias",
+    "A_log",
+    "linear_attn.norm.weight",
+]
+
 
 @torchrun_main
 def main(
