@@ -316,6 +316,7 @@ class AutoBridge(Generic[MegatronModelT]):
         cpu: bool = False,
         show_progress: bool = True,
         conversion_tasks: Optional[List[WeightConversionTask]] = None,
+        merge_adapter_weights: bool = True,
     ) -> Iterable["HFWeightTuple"]:
         """
         Export Megatron model weights to HuggingFace format.
@@ -361,6 +362,35 @@ class AutoBridge(Generic[MegatronModelT]):
             cpu=cpu,
             show_progress=show_progress,
             conversion_tasks=conversion_tasks,
+            merge_adapter_weights=merge_adapter_weights,
+        )
+
+    def export_adapter_weights(
+        self,
+        model: list[MegatronModelT],
+        cpu: bool = True,
+        show_progress: bool = True,
+    ) -> Iterable["HFWeightTuple"]:
+        """
+        Export only adapter weights from a Megatron model without merging them into base tensors.
+
+        This is useful when you want to save or inspect LoRA adapters independently from the
+        underlying pretrained weights.
+
+        Args:
+            model: Megatron model instance or list of instances
+            cpu: Whether to move tensors to CPU before yielding
+            show_progress: Display progress bar during export
+
+        Yields:
+            HFWeightTuple: Named tuples of (param_name, weight_tensor, megatron_param_name) for adapter parameters
+        """
+        dispatch_instance = (self._causal_lm_architecture, self._get_model_instance(model))
+        return model_bridge.stream_adapter_weights_megatron_to_hf(
+            dispatch_instance,
+            model,
+            cpu=cpu,
+            show_progress=show_progress,
         )
 
     def save_hf_pretrained(
