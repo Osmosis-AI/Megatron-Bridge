@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import itertools
+import logging
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -23,6 +24,8 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, TypeVar, Union
 
 import torch
 from megatron.core import parallel_state
+
+logger = logging.getLogger(__name__)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_rank, unwrap_model
 
@@ -497,6 +500,15 @@ class MegatronPeftBridge:
             hf_linear_out_name = self._resolve_hf_adapter_param_name(
                 mapping_registry, global_base_prefix, ".linear_out.weight", base_suffix, adapter_key
             )
+
+            # Skip adapters that can't be mapped to HF format (e.g. layers
+            # whose base weight has no HF counterpart in the mapping registry).
+            if hf_linear_in_name is None or hf_linear_out_name is None:
+                logger.debug(
+                    "Skipping adapter %s: unmappable HF names (in=%s, out=%s)",
+                    global_base_prefix, hf_linear_in_name, hf_linear_out_name,
+                )
+                continue
 
             linear_in_module, linear_in_weight = None, None
             linear_out_module, linear_out_weight = None, None
