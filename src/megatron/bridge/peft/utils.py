@@ -163,7 +163,7 @@ def is_expert_linear(fqn: str) -> bool:
         >>> is_expert_linear("model.layers.0.mlp.linear_fc1")
         False
     """
-    return re.match(r".*mlp\..*experts.*\.linear_fc[1-2]$", fqn) is not None
+    return re.match(r".*mlp\.(?!shared_).*experts.*\.linear_fc[1-2]$", fqn) is not None
 
 
 def wildcard_match(pattern: str, key: Optional[str]) -> Optional[bool]:
