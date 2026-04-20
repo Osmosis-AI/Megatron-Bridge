@@ -108,6 +108,21 @@ class GPTOSSBridge(MegatronModelBridge):
 
         return provider
 
+    def _get_grouped_expert_base_suffixes(self, num_moe_experts: int) -> list[str]:
+        """GPT-OSS grouped expert adapters are 2D (shared across all experts).
+
+        A single .weight0 lookup is sufficient for mapping resolution.
+        """
+        return [".weight0"]
+
+    def _prepare_expert_adapter_for_hf(
+        self, tensor: torch.Tensor, is_grouped_expert: bool
+    ) -> torch.Tensor:
+        """Restore 3D shape expected by HF for grouped expert adapters."""
+        if is_grouped_expert:
+            return tensor.unsqueeze(0)
+        return tensor
+
     def maybe_modify_loaded_hf_weight(
         self, hf_param: str | dict[str, str], hf_state_dict: Mapping[str, torch.Tensor]
     ) -> torch.Tensor:

@@ -723,6 +723,64 @@ def test_stream_weights_megatron_to_hf_skips_merge_when_disabled(monkeypatch):
     assert weights[0].param_name in {"hf.weight", "hf.base_layer.weight"}
 
 
+def test_stream_adapter_weights_megatron_to_hf_grouped_expert(monkeypatch):
+    """Verify grouped MoE expert adapters are exported with correct names and shapes."""
+    bridge = DummyBridge()
+
+    bridge._get_grouped_expert_base_suffixes = lambda num_experts: [".weight0"]
+    bridge._prepare_expert_adapter_for_hf = (
+        lambda tensor, is_grouped: tensor.unsqueeze(0) if is_grouped else tensor
+    )
+
+    adapter_task = AdapterWeightConversionTask(
+        global_base_prefix="decoder.layers.0.mlp.experts.linear_fc1",
+        adapter_key=None,
+        alpha=2,
+        dim=4,
+        linear_in_task=WeightConversionTask(
+            param_name="local_in",
+            global_param_name="decoder.layers.0.mlp.experts.linear_fc1.adapter.linear_in.weight",
+            mapping=Mock(),
+        ),
+        linear_out_task=WeightConversionTask(
+            param_name="local_out",
+            global_param_name="decoder.layers.0.mlp.experts.linear_fc1.adapter.linear_out.weight",
+            mapping=Mock(),
+        ),
+    )
+
+    adapter_weight = AdapterWeight(
+        global_base_prefix="decoder.layers.0.mlp.experts.linear_fc1",
+        adapter_key=None,
+        alpha=2,
+        dim=4,
+        linear_in_weight=MegatronWeightTuple("local_in", torch.ones(2, 2), vp_stage=0),
+        linear_out_weight=MegatronWeightTuple("local_out", 2 * torch.ones(2, 2), vp_stage=0),
+    )
+
+    monkeypatch.setattr(
+        bridge,
+        "build_adapter_conversion_tasks",
+        lambda *_: {"decoder.layers.0.mlp.experts.linear_fc1": [adapter_task]},
+    )
+    monkeypatch.setattr(bridge, "materialize_adapter_weights", lambda *_: [adapter_weight])
+    monkeypatch.setattr(
+        bridge,
+        "_get_base_hf_param_names_for_adapter",
+        lambda *_args, **_kwargs: ["model.layers.0.mlp.experts.gate_up_proj"],
+    )
+    monkeypatch.setattr(bridge, "_gather_expert_adapter_weight", lambda self_or_tensor, *a: self_or_tensor)
+
+    megatron_model = [SimpleNamespace(config=SimpleNamespace(num_moe_experts=8))]
+    weights = list(bridge.stream_adapter_weights_megatron_to_hf(megatron_model, cpu=False, show_progress=False))
+
+    assert len(weights) == 2
+    assert weights[0].param_name == "model.layers.0.mlp.experts.gate_up_proj.lora_A.weight"
+    assert weights[1].param_name == "model.layers.0.mlp.experts.gate_up_proj.lora_B.weight"
+    assert weights[0].weight.shape == (1, 2, 2)
+    assert weights[1].weight.shape == (1, 2, 2)
+
+
 def test_column_parallel_mapping_skips_ep_gather_for_adapters(monkeypatch):
     mapping = ColumnParallelMapping(
         "decoder.layers.0.mlp.experts.linear_fc1.adapter.linear_in.weight",
