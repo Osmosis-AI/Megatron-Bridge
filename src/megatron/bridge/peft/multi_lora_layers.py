@@ -277,34 +277,27 @@ class MultiLoRALinear(AdapterWrapper):
         self.n_adapters = n_adapters
         self.max_rank = dim
 
-        (
-            input_is_parallel,
-            in_features,
-            out_features,
-            _disable_tensor_parallel_comm,
-            disable_sequence_parallel_comm,
-            base_linear_is_parallel,
-        ) = get_adapter_attributes_from_linear(to_wrap)
+        attrs = get_adapter_attributes_from_linear(to_wrap)
 
-        self.input_is_parallel = base_linear_is_parallel
-        self.disable_sequence_parallel_comm = disable_sequence_parallel_comm
+        self.input_is_parallel = attrs.base_linear_is_parallel
+        self.disable_sequence_parallel_comm = attrs.disable_sequence_parallel_comm
         self.use_a2a = a2a_experimental
-        self._gather_output = base_linear_is_parallel
+        self._gather_output = attrs.base_linear_is_parallel
 
         # ModuleList of ParallelLinearAdapters gives per-adapter optimizer state
         # isolation, clean checkpoint serialization, and bridge export compatibility.
         self.adapters = nn.ModuleList([
             ParallelLinearAdapter(
-                in_features=in_features,
-                out_features=out_features,
+                in_features=attrs.in_features,
+                out_features=attrs.out_features,
                 dim=dim,
                 base_linear_name=full_name,
                 activation="identity",
                 alpha=alpha,
-                input_is_parallel=input_is_parallel,
+                input_is_parallel=attrs.input_is_parallel,
                 column_init_method=column_init_method,
                 row_init_method=row_init_method,
-                disable_sequence_parallel_comm=disable_sequence_parallel_comm,
+                disable_sequence_parallel_comm=attrs.disable_sequence_parallel_comm,
                 a2a_experimental=a2a_experimental,
                 dropout=dropout,
                 dropout_position=dropout_position,
