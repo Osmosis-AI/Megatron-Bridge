@@ -283,6 +283,7 @@ class MultiLoRALinear(AdapterWrapper):
         self.disable_sequence_parallel_comm = attrs.disable_sequence_parallel_comm
         self.use_a2a = a2a_experimental
         self._gather_output = attrs.base_linear_is_parallel
+        self._use_forloop_forward = False
 
         # ModuleList of ParallelLinearAdapters gives per-adapter optimizer state
         # isolation, clean checkpoint serialization, and bridge export compatibility.
@@ -329,39 +330,63 @@ class MultiLoRALinear(AdapterWrapper):
         x_flat = x.reshape(-1, x.shape[-1])
         offsets = tokens_per_adapter.cumsum(dim=0, dtype=torch.int32)
 
-        # Stack weights from individual adapters for grouped GEMM
+        if self._use_forloop_forward:
+            out = self._forward_forloop(x_flat, offsets, tokens_per_adapter)
+        else:
+            out = self._forward_grouped_gemm(x_flat, offsets, tokens_per_adapter)
+
+        return linear_output + out.reshape(linear_output.shape), bias
+
+    def _forward_grouped_gemm(
+        self, x_flat: torch.Tensor, offsets: torch.Tensor, tokens_per_adapter: torch.Tensor
+    ) -> torch.Tensor:
         stacked_A = torch.stack([a.linear_in.weight for a in self.adapters])
         stacked_B = torch.stack([a.linear_out.weight for a in self.adapters])
 
-        # Grouped GEMM: x @ A^T
         mid = torch._grouped_mm(x_flat, stacked_A.transpose(-2, -1), offsets)
 
-        # TP comm between A and B
         if self.input_is_parallel:
             mid = reduce_from_tensor_model_parallel_region(mid)
         else:
             mid = gather_from_tensor_model_parallel_region(mid)
 
-        # Grouped GEMM: mid @ B^T
         out = torch._grouped_mm(mid, stacked_B.transpose(-2, -1), offsets)
 
-        # TP comm for output
         if self._gather_output:
             out = gather_from_tensor_model_parallel_region(out)
 
-        # SP scatter (once)
         if not self.disable_sequence_parallel_comm and self.input_is_parallel:
             if self.use_a2a:
                 out = all2all_hp2sp(out)
             else:
                 out = scatter_to_sequence_parallel_region(out)
 
-        # Per-token scaling
         scaling = self.alpha_values / self.rank_values
         per_token_scaling = torch.repeat_interleave(scaling, tokens_per_adapter).unsqueeze(-1)
-        out = out * per_token_scaling
+        return out * per_token_scaling
 
-        return linear_output + out.reshape(linear_output.shape), bias
+    def _forward_forloop(
+        self, x_flat: torch.Tensor, offsets: torch.Tensor, tokens_per_adapter: torch.Tensor
+    ) -> torch.Tensor:
+        """Per-adapter for-loop forward using each adapter's own forward().
+
+        Matches the numerical behavior of single-LoRA / SGLang standard matmul.
+        """
+        adapter_outputs = []
+        prev = 0
+        for i in range(self.n_adapters):
+            cur = offsets[i].item()
+            if cur == prev:
+                prev = cur
+                continue
+            out = self.adapters[i](x_flat[prev:cur])
+            adapter_outputs.append(out)
+            prev = cur
+
+        if not adapter_outputs:
+            return torch.zeros_like(x_flat[:, :self.adapters[0].linear_out.weight.shape[0]])
+
+        return torch.cat(adapter_outputs, dim=0)
 
     def reset_adapter(self, idx: int) -> None:
         from megatron.bridge.peft.utils import ParallelLinearAdapter
@@ -414,6 +439,17 @@ def set_batch(model, tokens_per_adapter: torch.Tensor) -> None:
     """Set per-micro-batch routing on all MultiLoRA layers."""
     for module in _iter_multi_lora_modules(model):
         module.tokens_per_adapter = tokens_per_adapter
+
+
+def set_forloop_forward(model, enabled: bool = True) -> None:
+    """Toggle per-adapter for-loop forward instead of grouped GEMM.
+
+    The for-loop path uses each adapter's own forward() with standard matmul,
+    matching SGLang's numerical behavior. Slower but numerically consistent.
+    """
+    for module in _iter_multi_lora_modules(model):
+        if isinstance(module, MultiLoRALinear):
+            module._use_forloop_forward = enabled
 
 
 def register_adapter(model, idx: int, rank: int, alpha: float) -> None:
