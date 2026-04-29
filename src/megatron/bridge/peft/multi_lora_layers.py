@@ -459,12 +459,25 @@ def load_adapter(model, idx: int, state_dict: Dict[str, torch.Tensor]) -> None:
 
 
 def apply_rank_masks(model, idx: Optional[int] = None) -> None:
-    """Re-zero weight dimensions beyond actual_rank for adapter slot(s).
+    """Re-zero weight dimensions beyond ``actual_rank`` for adapter slot(s).
 
     Safety net for use after optimizer steps. The padded dimensions should
-    already be zero (gradients are self-reinforcing), but this guards against
-    numerical drift from optimizer internals.
+    already be zero (gradients through them are self-reinforcing), but this
+    guards against numerical drift from optimizer internals.
+
+    TP layout for the rank dimension:
+
+    * ``linear_in.weight`` rank dim is ``shape[0]``. For column-parallel base
+      layers (``linear_qkv``, ``linear_fc1``) it is sharded across TP ranks —
+      rank ``r`` owns global rows ``[r*L : (r+1)*L]`` where ``L = max_rank/tp``.
+      For row-parallel base or plain ``nn.Linear`` it is replicated. We map
+      the global cutoff ``actual_rank`` into the local shard.
+    * ``linear_out.weight`` rank dim is ``shape[1]``. It is the input dim of a
+      ``ColumnParallelLinear`` and is replicated across TP, so it can be
+      masked uniformly.
     """
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+
     for module in _iter_multi_lora_modules(model):
         slots = range(module.n_adapters) if idx is None else [idx]
         for i in slots:
@@ -472,9 +485,13 @@ def apply_rank_masks(model, idx: Optional[int] = None) -> None:
             if actual_rank >= module.max_rank:
                 continue
             adapter = module.adapters[i]
-            r_in = actual_rank * adapter.linear_in.weight.shape[0] // module.max_rank
+            local_rank_dim = adapter.linear_in.weight.shape[0]
+            shard_start = tp_rank * local_rank_dim if local_rank_dim < module.max_rank else 0
+            local_start = max(0, actual_rank - shard_start)
+
             with torch.no_grad():
-                adapter.linear_in.weight.data[r_in:].zero_()
+                if local_start < local_rank_dim:
+                    adapter.linear_in.weight.data[local_start:].zero_()
                 adapter.linear_out.weight.data[:, actual_rank:].zero_()
 
 
