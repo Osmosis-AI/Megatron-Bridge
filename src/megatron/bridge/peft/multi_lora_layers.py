@@ -18,12 +18,9 @@
 *N* concurrent LoRA adapters.  The active adapter is selected at forward time
 via per-layer ``tokens_per_adapter`` set by :func:`set_batch`.
 
-Two forward implementations are provided:
-
-* **for-loop** (default) — slices tokens by adapter, runs each adapter's
-  full ``ParallelLinearAdapter.forward()``.  TP/SP-safe by construction.
-* **grouped GEMM** — stacks raw weights and uses ``torch._grouped_mm``
-  for a single fused kernel.  Requires manual TP/SP handling.  Experimental.
+Forward stacks the raw weights of all adapters and uses ``torch._grouped_mm``
+for a single fused kernel; TP/SP collectives are issued once around the two
+GEMMs to match the layout of the wrapped base linear.
 """
 
 import math
@@ -279,11 +276,15 @@ class MultiLoRALinear(AdapterWrapper):
 
         attrs = get_adapter_attributes_from_linear(to_wrap)
 
-        self.input_is_parallel = attrs.base_linear_is_parallel
+        # input_is_parallel distinguishes column-parallel base (False, e.g. linear_qkv,
+        # linear_fc1) from row-parallel base (True, e.g. linear_proj, linear_fc2).
+        # It controls which TP collective runs between the two grouped GEMMs and
+        # whether the second GEMM's output needs to be all-gathered to match the
+        # wrapped base linear's output layout.
+        self.input_is_parallel = attrs.input_is_parallel
         self.disable_sequence_parallel_comm = attrs.disable_sequence_parallel_comm
         self.use_a2a = a2a_experimental
-        self._gather_output = attrs.base_linear_is_parallel
-        self._use_forloop_forward = False
+        self._gather_output = attrs.input_is_parallel
 
         # ModuleList of ParallelLinearAdapters gives per-adapter optimizer state
         # isolation, clean checkpoint serialization, and bridge export compatibility.
@@ -323,28 +324,23 @@ class MultiLoRALinear(AdapterWrapper):
         tokens_per_adapter = self.tokens_per_adapter
         x = layernorm_output.contiguous()
 
-        # SP gather (once)
+        # SP gather (once) — for column-parallel base layers without an LN-fused
+        # gather, the layernorm output is still SP-sharded and must be gathered
+        # to full sequence before the adapter matmul.
         if not self.disable_sequence_parallel_comm and not self.input_is_parallel:
             x = gather_from_sequence_parallel_region(x)
 
         x_flat = x.reshape(-1, x.shape[-1])
         offsets = tokens_per_adapter.cumsum(dim=0, dtype=torch.int32)
 
-        if self._use_forloop_forward:
-            out = self._forward_forloop(x_flat, offsets, tokens_per_adapter)
-        else:
-            out = self._forward_grouped_gemm(x_flat, offsets, tokens_per_adapter)
-
-        return linear_output + out.reshape(linear_output.shape), bias
-
-    def _forward_grouped_gemm(
-        self, x_flat: torch.Tensor, offsets: torch.Tensor, tokens_per_adapter: torch.Tensor
-    ) -> torch.Tensor:
         stacked_A = torch.stack([a.linear_in.weight for a in self.adapters])
         stacked_B = torch.stack([a.linear_out.weight for a in self.adapters])
 
         mid = torch._grouped_mm(x_flat, stacked_A.transpose(-2, -1), offsets)
 
+        # TP collective between A and B: row-parallel base needs an all-reduce
+        # of the partial sums; column-parallel base needs an all-gather of the
+        # rank-sharded output to a full [tokens, dim] for the second GEMM.
         if self.input_is_parallel:
             mid = reduce_from_tensor_model_parallel_region(mid)
         else:
@@ -352,6 +348,9 @@ class MultiLoRALinear(AdapterWrapper):
 
         out = torch._grouped_mm(mid, stacked_B.transpose(-2, -1), offsets)
 
+        # Match the wrapped base linear's output layout: row-parallel base
+        # produces a fully-summed [tokens, h_out] tensor (which we then SP
+        # scatter); column-parallel base keeps the [tokens, h_out/tp] shard.
         if self._gather_output:
             out = gather_from_tensor_model_parallel_region(out)
 
@@ -363,30 +362,9 @@ class MultiLoRALinear(AdapterWrapper):
 
         scaling = self.alpha_values / self.rank_values
         per_token_scaling = torch.repeat_interleave(scaling, tokens_per_adapter).unsqueeze(-1)
-        return out * per_token_scaling
+        out = out * per_token_scaling
 
-    def _forward_forloop(
-        self, x_flat: torch.Tensor, offsets: torch.Tensor, tokens_per_adapter: torch.Tensor
-    ) -> torch.Tensor:
-        """Per-adapter for-loop forward using each adapter's own forward().
-
-        Matches the numerical behavior of single-LoRA / SGLang standard matmul.
-        """
-        adapter_outputs = []
-        prev = 0
-        for i in range(self.n_adapters):
-            cur = offsets[i].item()
-            if cur == prev:
-                prev = cur
-                continue
-            out = self.adapters[i](x_flat[prev:cur])
-            adapter_outputs.append(out)
-            prev = cur
-
-        if not adapter_outputs:
-            return torch.zeros_like(x_flat[:, :self.adapters[0].linear_out.weight.shape[0]])
-
-        return torch.cat(adapter_outputs, dim=0)
+        return linear_output + out.reshape(linear_output.shape), bias
 
     def reset_adapter(self, idx: int) -> None:
         from megatron.bridge.peft.utils import ParallelLinearAdapter
@@ -439,17 +417,6 @@ def set_batch(model, tokens_per_adapter: torch.Tensor) -> None:
     """Set per-micro-batch routing on all MultiLoRA layers."""
     for module in _iter_multi_lora_modules(model):
         module.tokens_per_adapter = tokens_per_adapter
-
-
-def set_forloop_forward(model, enabled: bool = True) -> None:
-    """Toggle per-adapter for-loop forward instead of grouped GEMM.
-
-    The for-loop path uses each adapter's own forward() with standard matmul,
-    matching SGLang's numerical behavior. Slower but numerically consistent.
-    """
-    for module in _iter_multi_lora_modules(model):
-        if isinstance(module, MultiLoRALinear):
-            module._use_forloop_forward = enabled
 
 
 def register_adapter(model, idx: int, rank: int, alpha: float) -> None:
