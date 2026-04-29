@@ -348,6 +348,14 @@ class MultiLoRALinear(AdapterWrapper):
 
         out = torch._grouped_mm(mid, stacked_B.transpose(-2, -1), offsets)
 
+        # Per-token scaling is applied *before* the output-side TP/SP comms.
+        # ``per_token_scaling`` is indexed by the full token count
+        # (``tokens_per_adapter`` sums to it); doing it after a sequence-parallel
+        # scatter would leave ``out`` with ``tokens/tp`` rows and crash here.
+        scaling = self.alpha_values / self.rank_values
+        per_token_scaling = torch.repeat_interleave(scaling, tokens_per_adapter).unsqueeze(-1)
+        out = out * per_token_scaling
+
         # Match the wrapped base linear's output layout: row-parallel base
         # produces a fully-summed [tokens, h_out] tensor (which we then SP
         # scatter); column-parallel base keeps the [tokens, h_out/tp] shard.
@@ -359,10 +367,6 @@ class MultiLoRALinear(AdapterWrapper):
                 out = all2all_hp2sp(out)
             else:
                 out = scatter_to_sequence_parallel_region(out)
-
-        scaling = self.alpha_values / self.rank_values
-        per_token_scaling = torch.repeat_interleave(scaling, tokens_per_adapter).unsqueeze(-1)
-        out = out * per_token_scaling
 
         return linear_output + out.reshape(linear_output.shape), bias
 
