@@ -230,6 +230,37 @@ class SimpleMultiLoRALinear(nn.Linear):
         adapter._get_init_fn(self.column_init_method)(adapter.linear_in.weight.data)
         adapter._get_init_fn(self.row_init_method)(adapter.linear_out.weight.data)
 
+    def register_slot(self, idx: int, rank: int, alpha: float) -> None:
+        """Bind ``rank``/``alpha`` to slot ``idx`` and establish the rank-mask invariant."""
+        assert 0 < rank <= self.max_rank, (
+            f"Adapter rank {rank} must be in (0, {self.max_rank}]"
+        )
+        self.alpha_values[idx] = alpha
+        self.rank_values[idx] = rank
+        self._apply_rank_mask(idx)
+
+    def unregister_slot(self, idx: int) -> None:
+        """Free slot ``idx``: zero alpha, restore max rank, re-init weights."""
+        self.alpha_values[idx] = 0
+        self.rank_values[idx] = self.max_rank
+        self.reset_adapter(idx)
+
+    def _apply_rank_mask(self, idx: int) -> None:
+        """Zero padded rows of A and padded cols of B for slot ``idx``.
+
+        Plain ``nn.Linear``-backed adapters have no TP sharding, so the local
+        cutoff equals the global ``actual_rank`` directly. With both sides
+        zero in the padded region, the autograd chain through the two GEMMs
+        keeps the gradient zero there too — no periodic re-masking needed.
+        """
+        actual_rank = int(self.rank_values[idx].item())
+        if actual_rank >= self.max_rank:
+            return
+        adapter = self.adapters[idx]
+        with torch.no_grad():
+            adapter.linear_in.weight.data[actual_rank:].zero_()
+            adapter.linear_out.weight.data[:, actual_rank:].zero_()
+
     def named_parameters_for_adapter(self, idx: int) -> Iterator[Tuple[str, nn.Parameter]]:
         prefix = f"adapters.{idx}."
         for name, param in self.adapters[idx].named_parameters():
@@ -377,6 +408,50 @@ class MultiLoRALinear(AdapterWrapper):
         col_fn(self.adapters[idx].linear_in.weight.data)
         row_fn(self.adapters[idx].linear_out.weight.data)
 
+    def register_slot(self, idx: int, rank: int, alpha: float) -> None:
+        """Bind ``rank``/``alpha`` to slot ``idx`` and establish the rank-mask invariant."""
+        assert 0 < rank <= self.max_rank, (
+            f"Adapter rank {rank} must be in (0, {self.max_rank}]"
+        )
+        self.alpha_values[idx] = alpha
+        self.rank_values[idx] = rank
+        self._apply_rank_mask(idx)
+
+    def unregister_slot(self, idx: int) -> None:
+        """Free slot ``idx``: zero alpha, restore max rank, re-init weights."""
+        self.alpha_values[idx] = 0
+        self.rank_values[idx] = self.max_rank
+        self.reset_adapter(idx)
+
+    def _apply_rank_mask(self, idx: int) -> None:
+        """Zero padded rows of A and padded cols of B for slot ``idx``.
+
+        For column-parallel base layers (``linear_qkv``, ``linear_fc1``)
+        ``linear_in.weight`` is sharded across TP — rank ``r`` owns global
+        rows ``[r*L : (r+1)*L]`` where ``L = max_rank/tp``. For row-parallel
+        base it is replicated. Map the global cutoff ``actual_rank`` into
+        the local shard before zeroing.
+
+        With both sides zero in the padded region, the autograd chain through
+        the two GEMMs keeps the gradient zero there too — no periodic
+        re-masking needed during training.
+        """
+        actual_rank = int(self.rank_values[idx].item())
+        if actual_rank >= self.max_rank:
+            return
+        adapter = self.adapters[idx]
+        local_rank_dim = adapter.linear_in.weight.shape[0]
+        if local_rank_dim < self.max_rank:
+            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+            shard_start = tp_rank * local_rank_dim
+            local_start = max(0, actual_rank - shard_start)
+        else:
+            local_start = actual_rank
+        with torch.no_grad():
+            if local_start < local_rank_dim:
+                adapter.linear_in.weight.data[local_start:].zero_()
+            adapter.linear_out.weight.data[:, actual_rank:].zero_()
+
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -424,22 +499,20 @@ def set_batch(model, tokens_per_adapter: torch.Tensor) -> None:
 
 
 def register_adapter(model, idx: int, rank: int, alpha: float) -> None:
-    """Set alpha and rank for a slot on all MultiLoRA layers."""
+    """Bind ``rank``/``alpha`` to slot ``idx`` on every multi-LoRA layer.
+
+    Thin iterator over the model — the per-slot setup (rank/alpha bookkeeping
+    and rank-mask invariant) lives on the layer itself in
+    :meth:`MultiLoRALinear.register_slot` / :meth:`SimpleMultiLoRALinear.register_slot`.
+    """
     for module in _iter_multi_lora_modules(model):
-        assert 0 < rank <= module.max_rank, (
-            f"Adapter rank {rank} must be in (0, {module.max_rank}]"
-        )
-        module.alpha_values[idx] = alpha
-        module.rank_values[idx] = rank
-    apply_rank_masks(model, idx)
+        module.register_slot(idx, rank, alpha)
 
 
 def unregister_adapter(model, idx: int) -> None:
-    """Reset weights and alpha/rank for a slot on all MultiLoRA layers."""
+    """Free slot ``idx`` on every multi-LoRA layer (zero alpha, re-init weights)."""
     for module in _iter_multi_lora_modules(model):
-        module.alpha_values[idx] = 0
-        module.rank_values[idx] = module.max_rank
-        module.reset_adapter(idx)
+        module.unregister_slot(idx)
 
 
 def load_adapter(model, idx: int, state_dict: Dict[str, torch.Tensor]) -> int:
@@ -470,43 +543,6 @@ def load_adapter(model, idx: int, state_dict: Dict[str, torch.Tensor]) -> int:
                 param.data.copy_(src)
                 loaded += 1
     return loaded
-
-
-def apply_rank_masks(model, idx: Optional[int] = None) -> None:
-    """Re-zero weight dimensions beyond ``actual_rank`` for adapter slot(s).
-
-    Safety net for use after optimizer steps. The padded dimensions should
-    already be zero (gradients through them are self-reinforcing), but this
-    guards against numerical drift from optimizer internals.
-
-    TP layout for the rank dimension:
-
-    * ``linear_in.weight`` rank dim is ``shape[0]``. For column-parallel base
-      layers (``linear_qkv``, ``linear_fc1``) it is sharded across TP ranks —
-      rank ``r`` owns global rows ``[r*L : (r+1)*L]`` where ``L = max_rank/tp``.
-      For row-parallel base or plain ``nn.Linear`` it is replicated. We map
-      the global cutoff ``actual_rank`` into the local shard.
-    * ``linear_out.weight`` rank dim is ``shape[1]``. It is the input dim of a
-      ``ColumnParallelLinear`` and is replicated across TP, so it can be
-      masked uniformly.
-    """
-    tp_rank = parallel_state.get_tensor_model_parallel_rank()
-
-    for module in _iter_multi_lora_modules(model):
-        slots = range(module.n_adapters) if idx is None else [idx]
-        for i in slots:
-            actual_rank = int(module.rank_values[i].item())
-            if actual_rank >= module.max_rank:
-                continue
-            adapter = module.adapters[i]
-            local_rank_dim = adapter.linear_in.weight.shape[0]
-            shard_start = tp_rank * local_rank_dim if local_rank_dim < module.max_rank else 0
-            local_start = max(0, actual_rank - shard_start)
-
-            with torch.no_grad():
-                if local_start < local_rank_dim:
-                    adapter.linear_in.weight.data[local_start:].zero_()
-                adapter.linear_out.weight.data[:, actual_rank:].zero_()
 
 
 def expose_adapter_slot(model, idx: int):
