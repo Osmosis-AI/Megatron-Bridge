@@ -442,24 +442,34 @@ def unregister_adapter(model, idx: int) -> None:
         module.reset_adapter(idx)
 
 
-def load_adapter(model, idx: int, state_dict: Dict[str, torch.Tensor]) -> None:
-    """Load weights into a specific adapter slot across all MultiLoRA layers.
+def load_adapter(model, idx: int, state_dict: Dict[str, torch.Tensor]) -> int:
+    """Load Megatron-shard format adapter weights into slot ``idx``.
 
-    Supports loading adapters with rank <= max_rank. When rank < max_rank,
-    weights are zero-padded to max_rank. The rank dimension is always dim 0
-    for linear_in (A) and dim 1 for linear_out (B), regardless of TP type.
+    ``state_dict`` must use the *Megatron-native* names produced by saving
+    while ``expose_adapter_slot(model, idx)`` is active — i.e. the same
+    layout this function constructs to look them up. Each tensor is the
+    local TP/PP shard, copied straight into the slot parameter with no
+    gather, scatter, or rank-padding logic.
+
+    Saving from slot A and loading into slot B is fine because the slot
+    index is stripped from the name (``...adapter.linear_in.weight``)
+    while ``expose_adapter_slot`` is active.
+
+    Returns the number of tensors loaded (for logging / sanity checks).
     """
-    for module in _iter_multi_lora_modules(model):
-        adapter = module.adapters[idx]
-        for key, value in state_dict.items():
-            if "linear_in" in key or "lora_A" in key:
-                w = adapter.linear_in.weight.data
-                w.zero_()
-                w[:value.shape[0]] = value
-            elif "linear_out" in key or "lora_B" in key:
-                w = adapter.linear_out.weight.data
-                w.zero_()
-                w[:, :value.shape[1]] = value
+    loaded = 0
+    with expose_adapter_slot(model, idx):
+        models = model if isinstance(model, list) else [model]
+        for chunk in models:
+            for name, param in chunk.named_parameters():
+                if ".adapter." not in name:
+                    continue
+                if name not in state_dict:
+                    continue
+                src = state_dict[name].to(device=param.device, dtype=param.dtype)
+                param.data.copy_(src)
+                loaded += 1
+    return loaded
 
 
 def apply_rank_masks(model, idx: Optional[int] = None) -> None:
@@ -502,8 +512,17 @@ def apply_rank_masks(model, idx: Optional[int] = None) -> None:
 def expose_adapter_slot(model, idx: int):
     """Context manager that temporarily exposes one adapter slot as ``.adapter``.
 
-    This makes each MultiLoRALinear look like a standard single-LoRA module
-    to the bridge's export_adapter_weights, which looks for ``.adapter.linear_in.weight``.
+    Used by two consumers:
+
+    * The bridge's ``export_adapter_weights`` looks for ``.adapter.linear_in.weight``
+      (single-LoRA layout) on each wrapped module.
+    * Megatron-native save/load walk ``model.named_parameters()`` and want names
+      that don't contain the slot index, so saving from slot ``A`` and loading into
+      slot ``B`` produces matching keys.
+
+    Both ``MultiLoRALinear`` and ``SimpleMultiLoRALinear`` are handled via the
+    common ``.adapters`` ModuleList — duck-typed rather than ``isinstance``-checked
+    so future multi-LoRA module types are picked up automatically.
     """
     from contextlib import contextmanager
 
@@ -512,13 +531,14 @@ def expose_adapter_slot(model, idx: int):
         modules = list(_iter_multi_lora_modules(model))
         saved = {}
         for m in modules:
-            if isinstance(m, MultiLoRALinear):
+            if "adapters" in m._modules:
                 saved[id(m)] = m._modules.pop("adapters")
                 m.adapter = saved[id(m)][idx]
 
         yield
+
         for m in modules:
-            if isinstance(m, MultiLoRALinear):
+            if id(m) in saved:
                 if "adapter" in m._modules:
                     del m._modules["adapter"]
                 m._modules["adapters"] = saved[id(m)]
