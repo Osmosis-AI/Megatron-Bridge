@@ -124,6 +124,7 @@ class Qwen3VLModelProvider(GPTModelProvider):
             vision_transformer_config=hf_vision_config,
             pre_process=pre_process,
             post_process=post_process,
+            pg_collection=self._pg_collection,
         )
 
         # Apply freeze options if any are enabled for fine-tuning
@@ -273,6 +274,7 @@ class Qwen3VLMoEModelProvider(GPTModelProvider):
             vision_transformer_config=hf_vision_config,
             pre_process=pre_process,
             post_process=post_process,
+            pg_collection=self._pg_collection,
         )
 
         # Apply freeze options if any are enabled for fine-tuning

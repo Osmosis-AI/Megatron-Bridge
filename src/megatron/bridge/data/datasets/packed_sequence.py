@@ -13,11 +13,14 @@
 # limitations under the License.
 import json
 import logging
+import multiprocessing as mp
 from dataclasses import dataclass
+from multiprocessing import Pool
 from pathlib import Path
 
 import numpy as np
 from megatron.core.msc_utils import MultiStorageClientFeature
+from tqdm import tqdm
 
 from megatron.bridge.data.datasets.packing_utils import create_hist, create_packing_strategy, fill_packing_strategy
 from megatron.bridge.data.datasets.sft import create_sft_dataset
@@ -26,6 +29,25 @@ from megatron.bridge.training.tokenizers.tokenizer import MegatronTokenizer
 
 logger = logging.getLogger(__name__)
 
+_shared_dataset = None
+
+
+def _tokenize_get_item(i):
+    return _shared_dataset[i]
+
+
+def _tokenize_init_worker(dataset):
+    global _shared_dataset
+    _shared_dataset = dataset
+
+
+def _retrieve_tokenized(dataset, num_workers):
+    if num_workers == 1:
+        return np.array([dataset[i] for i in tqdm(range(len(dataset)))])
+    num_workers = num_workers if num_workers > 0 else mp.cpu_count()
+    with Pool(num_workers, initializer=_tokenize_init_worker, initargs=(dataset,)) as pool:
+        return np.array(list(tqdm(pool.imap(_tokenize_get_item, range(len(dataset))), total=len(dataset))))
+
 
 def tokenize_dataset(
     path: Path,
@@ -33,6 +55,8 @@ def tokenize_dataset(
     max_seq_length: int,
     seed: int,
     dataset_kwargs: dict | None = None,
+    pad_seq_to_mult: int | None = 1,
+    num_tokenizer_workers: int = -1,
 ):
     """
     Tokenizes a dataset from the provided path using the specified tokenizer
@@ -45,6 +69,8 @@ def tokenize_dataset(
         seed (int): Random seed for shuffling the dataset.
         dataset_kwargs (dict | None): Additional keyword arguments to pass to create_sft_dataset.
             Can include 'chat', 'use_hf_tokenizer_chat_template', 'tool_schemas', etc.
+        pad_seq_to_mult (int | None): Optional multiple to pad each sequence to during packing
+            preparation (e.g., set to 2 * context_parallel_size for THD CP).
 
     Returns:
         np.ndarray: A NumPy array containing the tokenized data.
@@ -66,15 +92,56 @@ def tokenize_dataset(
         if hasattr(tokenizer, "_tokenizer"):
             tokenizer._tokenizer.chat_template = chat_template
 
+    if pad_seq_to_mult is not None and pad_seq_to_mult <= 0:
+        raise ValueError("pad_seq_to_mult must be a positive integer when provided.")
+
+    # Keep the historical minimum of 16 unless a larger multiple is requested.
+    pad_seq_length_to_mult = 1 if pad_seq_to_mult is None else max(1, pad_seq_to_mult)
+
     dataset = create_sft_dataset(
         path=path,
         tokenizer=tokenizer,
         seq_length=max_seq_length,
         seed=seed,
         is_test=True,
+        pad_seq_length_to_mult=pad_seq_length_to_mult,
         **dataset_kwargs,
     )
-    return np.array([dataset[i] for i in range(len(dataset))])
+
+    pad_id = dataset.tokenizer.eod
+    pad_seq_length_to_mult = dataset.pad_seq_length_to_mult
+    max_seq_length = dataset.max_seq_length
+    dataset = _retrieve_tokenized(dataset, num_tokenizer_workers)
+
+    if pad_seq_to_mult > 1:
+
+        def pre_pad_dataset(data, max_seq_length, max_length_to_pad, pad_id):
+            """
+            Pad each individual data point to the length of max_length_to_pad.
+            This keeps packed samples divisible by the requested multiple (used for CP/THD).
+            """
+            assert max_seq_length >= max_length_to_pad
+            for key, val in data.items():
+                if key in {"input_ids", "context_ids"}:
+                    if len(val) <= max_length_to_pad:
+                        # input_ids are truncated by 1 for labels; add 1 extra pad token
+                        val = val + [pad_id] * (max_length_to_pad - len(val) + 1)
+                    elif len(val) > max_seq_length:
+                        logging.info(
+                            "Sequence length %d is larger than max_seq_length %d; truncating for packing.",
+                            len(val),
+                            max_seq_length,
+                        )
+                        val = val[:max_seq_length]
+                    data[key] = val
+            return
+
+        ceil_to_nearest = lambda n, m: (n + m - 1) // m * m
+        for data in dataset:
+            max_length_to_pad = min(max_seq_length, ceil_to_nearest(len(data["input_ids"]), pad_seq_length_to_mult))
+            pre_pad_dataset(data, max_seq_length, max_length_to_pad, pad_id)
+
+    return dataset
 
 
 def prepare_packed_sequence_data(
@@ -87,6 +154,8 @@ def prepare_packed_sequence_data(
     seed: int | None = 0,
     packing_algorithm: str = "first_fit_shuffle",
     dataset_kwargs: dict | None = None,
+    pad_seq_to_mult: int | None = 1,
+    num_tokenizer_workers: int = -1,
 ):
     """
     Prepares a packed sequence dataset from a given input file and saves it to an output file.
@@ -103,12 +172,22 @@ def prepare_packed_sequence_data(
                 currently supports "first_fit_shuffle" and "first_fit_decreasing".
         dataset_kwargs (dict | None): Additional keyword arguments to pass to create_sft_dataset.
             Enables packing with chat templates, tool schemas, etc.
+        pad_seq_to_mult (int | None): Optional multiple to pad each sequence to during packing
+            preparation (e.g., set to 2 * context_parallel_size for THD CP).
 
     Returns:
         None: Saves the packed sequence data to the specified output path.
     """
     logger.info(f"Preparing packed sequence from {input_path}")
-    dataset = tokenize_dataset(input_path, tokenizer, max_seq_length, seed, dataset_kwargs)
+    dataset = tokenize_dataset(
+        input_path,
+        tokenizer,
+        max_seq_length,
+        seed,
+        dataset_kwargs,
+        pad_seq_to_mult=pad_seq_to_mult,
+        num_tokenizer_workers=num_tokenizer_workers,
+    )
     sequences, histogram = create_hist(dataset, max_seq_length)
 
     assignments, packing_metadata = create_packing_strategy(histogram, packed_sequence_size, packing_algorithm)
@@ -166,6 +245,12 @@ class PackedSequenceSpecs:
     This field is set by llm.finetune api.
     """
 
+    num_tokenizer_workers: int = -1
+    """
+    The number of worker processes to use for tokenization when preparing the packed sequence dataset.
+    If -1, the number of workers will be set to the number of CPU cores available
+    """
+
     packed_train_data_path: str = None
     """
     If specified, use this file for the packed training dataset instead of the default path.
@@ -184,6 +269,11 @@ class PackedSequenceSpecs:
     pad_cu_seqlens: bool = False
     """
     If True, pad cu_seqlens to a constant size, which is required for use with cudagraphs.
+    """
+    pad_seq_to_mult: int | None = 1
+    """
+    Optional multiple to pad each sample to when generating packed datasets.
+    For THD/context parallel, set to (context_parallel_size * 2) to keep samples divisible.
     """
 
     def __post_init__(self):
@@ -212,3 +302,6 @@ class PackedSequenceSpecs:
             assert self.packed_val_data_path.exists(), (
                 f"packed validation data file does not exist: {self.packed_val_data_path}"
             )
+
+        if self.pad_seq_to_mult is not None and self.pad_seq_to_mult <= 0:
+            raise ValueError("pad_seq_to_mult must be a positive integer when provided.")

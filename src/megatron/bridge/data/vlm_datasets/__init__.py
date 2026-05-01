@@ -21,6 +21,10 @@ Public API re-exports:
 - Collate fns: model-specific batch builders
 """
 
+try:
+    from megatron.bridge.data.energon.energon_provider import EnergonProvider
+except ImportError:
+    EnergonProvider = None  # megatron.energon not installed
 from megatron.bridge.data.vlm_datasets.collate import (
     COLLATE_FNS,
     default_collate_fn,
@@ -55,6 +59,7 @@ __all__ = [
     "HFDatasetConversationProvider",
     "PreloadedVLMConversationProvider",
     "MockVLMConversationProvider",
+    "EnergonProvider",
     # Collation utilities
     "COLLATE_FNS",
     "default_collate_fn",

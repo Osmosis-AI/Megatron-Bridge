@@ -44,7 +44,8 @@ def weights_verification_table(bridge, megatron_model) -> Table:
     table.add_column("Matches Original", justify="center")
 
     # Check each weight against the original HF-model
-    for name, param in bridge.export_hf_weights(megatron_model, show_progress=True):
+    for item in bridge.export_hf_weights(megatron_model, show_progress=True):
+        name, param = item.param_name, item.weight
         original_param = bridge.hf_pretrained.state[name]
         table.add_row(
             name,
@@ -183,6 +184,16 @@ def remove_non_pickleables(obj, max_depth: int = 3, current_depth: int = 0):
     if obj is None:
         return obj
 
+    # Explicitly drop process group objects without importing their classes directly.
+    cls = obj if isinstance(obj, type) else type(obj)
+    cls_module = getattr(cls, "__module__", "")
+    cls_name = getattr(cls, "__qualname__", getattr(cls, "__name__", ""))
+    if (cls_module, cls_name) in {
+        ("megatron.core.process_groups_config", "ProcessGroupCollection"),
+        ("torch._C._distributed_c10d", "ProcessGroup"),
+    }:
+        return None
+
     # Check if object is a problematic callable
     if callable(obj):
         # Allow classes/types but remove function objects, methods, partials
@@ -272,3 +283,13 @@ def persistent_buffers(model: torch.nn.Module) -> Iterable[Tuple[str, torch.Tens
             if local_name not in getattr(mod, "_non_persistent_buffers_set", set()):
                 full_name = f"{mod_prefix + '.' if mod_prefix else ''}{local_name}"
                 yield full_name, buffer
+
+
+def is_modelopt_dynamic_module(module):
+    """Check if a module is a modelopt dynamic module."""
+    try:
+        from modelopt.torch.opt.dynamic import DynamicModule
+
+        return isinstance(module, DynamicModule)
+    except ImportError:
+        return False

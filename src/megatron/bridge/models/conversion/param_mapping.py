@@ -29,7 +29,11 @@ from megatron.core.utils import (
     get_pg_size,
 )
 
-from megatron.bridge.models.conversion.utils import get_module_and_param_from_name, remove_non_pickleables
+from megatron.bridge.models.conversion.utils import (
+    get_module_and_param_from_name,
+    is_modelopt_dynamic_module,
+    remove_non_pickleables,
+)
 
 
 WeightType = TypeVar("WeightType", torch.Tensor, Dict[str, torch.Tensor])
@@ -499,7 +503,7 @@ class MegatronParamMapping(ABC, Generic[WeightType]):
 
         scatter_list = None
         if self.tp_rank == src_rank and splits:
-            scatter_list = [s.to(device=device, dtype=dtype) for s in splits]
+            scatter_list = [s.to(device=device, dtype=dtype).contiguous() for s in splits]
 
         torch.distributed.scatter(
             output,
@@ -811,11 +815,19 @@ class ColumnParallelMapping(MegatronParamMapping[torch.Tensor]):
             # the Megatron tensor which is in FP32. This will error. So we cast before the scatter.
             if hf_weights.dtype != target_param.dtype:
                 logger.warning(
-                    f"WARNING: Dtype mismatch between HuggingFace weights and Megatron module. "
-                    f"HF dtype: {hf_weights.dtype}. Megatron dtype: {target_param.dtype}. "
-                    f"Casting HF weights to Megatron dtype. THIS MAY RESULT IN A LOSS OF PRECISION. "
+                    f"Dtype mismatch: HF weights are {hf_weights.dtype} but "
+                    f"Megatron module expects {target_param.dtype}. "
+                    f"Casting HF weights to {target_param.dtype}."
                 )
                 hf_weights = hf_weights.to(target_param.dtype)
+
+            actual_dim0_size = hf_weights.shape[0]
+            expect_dim0_size = target_param.shape[0] * self.tp_size
+            if actual_dim0_size != expect_dim0_size:
+                assert self.megatron_param in {"embedding.word_embeddings.weight", "output_layer.weight"}, (
+                    f"{hf_weights.shape=} {target_param.shape=} {self.tp_size=} {self.megatron_param=} {self.hf_param=}"
+                )
+                hf_weights = _pad_right_dim0(hf_weights, pad_size=expect_dim0_size - actual_dim0_size)
 
             # For bias (1D), we still split along dim 0
             # For weight (2D), we split along dim 0 (output dimension)
@@ -861,6 +873,11 @@ class ColumnParallelMapping(MegatronParamMapping[torch.Tensor]):
             return self.gather_from_ep_ranks(full_weights, megatron_module, self.hf_param)
 
         return {str(self.hf_param): full_weights}
+
+
+def _pad_right_dim0(x: torch.Tensor, pad_size: int) -> torch.Tensor:
+    padder = torch.zeros((pad_size, *x.shape[1:]), dtype=x.dtype, device=x.device)
+    return torch.cat([x, padder], dim=0)
 
 
 class RowParallelMapping(MegatronParamMapping[torch.Tensor]):
@@ -1077,6 +1094,7 @@ class AutoMapping(MegatronParamMapping[torch.Tensor]):
     _MODULE_TYPE_REGISTRY: Dict[str, set] = {
         "column": {
             "ColumnParallelLinear",
+            "LinearCrossEntropyModule",
             "TEColumnParallelLinear",
             "TELayerNormColumnParallelLinear",
             "TEColumnParallelGroupedLinear",
@@ -1150,7 +1168,10 @@ class AutoMapping(MegatronParamMapping[torch.Tensor]):
 
     def _detect_parallelism_type(self, module: nn.Module) -> str:
         """Detect parallelism type from module."""
-        module_type = type(module).__name__
+        if is_modelopt_dynamic_module(module):
+            module_type = module.get_original_cls_by_level(level=0).__name__
+        else:
+            module_type = type(module).__name__
 
         # Handle fused modules like TELayerNormColumnParallelLinear
         # These modules have both column-parallel weights (weight, bias)
