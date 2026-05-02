@@ -230,8 +230,8 @@ class SimpleMultiLoRALinear(nn.Linear):
         adapter._get_init_fn(self.column_init_method)(adapter.linear_in.weight.data)
         adapter._get_init_fn(self.row_init_method)(adapter.linear_out.weight.data)
 
-    def register_slot(self, idx: int, rank: int, alpha: float) -> None:
-        """Bind ``rank``/``alpha`` to slot ``idx`` and establish the rank-mask invariant."""
+    def init_adapter_slot(self, idx: int, rank: int, alpha: float) -> None:
+        """Claim slot ``idx`` for an adapter: bind ``rank``/``alpha`` and apply the rank mask."""
         assert 0 < rank <= self.max_rank, (
             f"Adapter rank {rank} must be in (0, {self.max_rank}]"
         )
@@ -239,7 +239,7 @@ class SimpleMultiLoRALinear(nn.Linear):
         self.rank_values[idx] = rank
         self._apply_rank_mask(idx)
 
-    def unregister_slot(self, idx: int) -> None:
+    def clear_adapter_slot(self, idx: int) -> None:
         """Free slot ``idx``: zero alpha, restore max rank, re-init weights."""
         self.alpha_values[idx] = 0
         self.rank_values[idx] = self.max_rank
@@ -408,8 +408,8 @@ class MultiLoRALinear(AdapterWrapper):
         col_fn(self.adapters[idx].linear_in.weight.data)
         row_fn(self.adapters[idx].linear_out.weight.data)
 
-    def register_slot(self, idx: int, rank: int, alpha: float) -> None:
-        """Bind ``rank``/``alpha`` to slot ``idx`` and establish the rank-mask invariant."""
+    def init_adapter_slot(self, idx: int, rank: int, alpha: float) -> None:
+        """Claim slot ``idx`` for an adapter: bind ``rank``/``alpha`` and apply the rank mask."""
         assert 0 < rank <= self.max_rank, (
             f"Adapter rank {rank} must be in (0, {self.max_rank}]"
         )
@@ -417,7 +417,7 @@ class MultiLoRALinear(AdapterWrapper):
         self.rank_values[idx] = rank
         self._apply_rank_mask(idx)
 
-    def unregister_slot(self, idx: int) -> None:
+    def clear_adapter_slot(self, idx: int) -> None:
         """Free slot ``idx``: zero alpha, restore max rank, re-init weights."""
         self.alpha_values[idx] = 0
         self.rank_values[idx] = self.max_rank
@@ -498,21 +498,24 @@ def set_batch(model, tokens_per_adapter: torch.Tensor) -> None:
         module.tokens_per_adapter = tokens_per_adapter
 
 
-def register_adapter(model, idx: int, rank: int, alpha: float) -> None:
-    """Bind ``rank``/``alpha`` to slot ``idx`` on every multi-LoRA layer.
+def init_adapter_slot(model, idx: int, rank: int, alpha: float) -> None:
+    """Claim slot ``idx`` across every multi-LoRA layer for an adapter.
 
-    Thin iterator over the model — the per-slot setup (rank/alpha bookkeeping
-    and rank-mask invariant) lives on the layer itself in
-    :meth:`MultiLoRALinear.register_slot` / :meth:`SimpleMultiLoRALinear.register_slot`.
+    A model-wide adapter is the set of slot-``idx`` chunks across all layers;
+    this initialises that set with the given ``rank``/``alpha``. Thin iterator
+    over the model — per-slot setup (rank/alpha bookkeeping + rank-mask
+    invariant) lives on the layer itself in
+    :meth:`MultiLoRALinear.init_adapter_slot` /
+    :meth:`SimpleMultiLoRALinear.init_adapter_slot`.
     """
     for module in _iter_multi_lora_modules(model):
-        module.register_slot(idx, rank, alpha)
+        module.init_adapter_slot(idx, rank, alpha)
 
 
-def unregister_adapter(model, idx: int) -> None:
-    """Free slot ``idx`` on every multi-LoRA layer (zero alpha, re-init weights)."""
+def clear_adapter_slot(model, idx: int) -> None:
+    """Release slot ``idx`` across every multi-LoRA layer (zero alpha, re-init weights)."""
     for module in _iter_multi_lora_modules(model):
-        module.unregister_slot(idx)
+        module.clear_adapter_slot(idx)
 
 
 def load_adapter(model, idx: int, state_dict: Dict[str, torch.Tensor]) -> int:
