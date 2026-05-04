@@ -16,7 +16,7 @@
 
 :class:`MultiLoRALinear` wraps a single Megatron parallel linear module with
 *N* concurrent LoRA adapters.  The active adapter is selected at forward time
-via per-layer ``tokens_per_adapter`` set by :func:`set_batch`.
+via per-layer ``tokens_per_adapter`` set by :func:`set_tokens_per_adapter_slot`.
 
 Forward stacks the raw weights of all adapters and uses ``torch._grouped_mm``
 for a single fused kernel; TP/SP collectives are issued once around the two
@@ -492,8 +492,13 @@ def _iter_multi_lora_modules(model):
                 yield module
 
 
-def set_batch(model, tokens_per_adapter: torch.Tensor) -> None:
-    """Set per-micro-batch routing on all MultiLoRA layers."""
+def set_tokens_per_adapter_slot(model, tokens_per_adapter: torch.Tensor) -> None:
+    """Route a packed micro-batch to its per-slot token spans.
+
+    ``tokens_per_adapter[i]`` is the number of contiguous tokens in the
+    upcoming forward that belong to adapter slot ``i``. Must sum to the total
+    token count of the micro-batch.
+    """
     for module in _iter_multi_lora_modules(model):
         module.tokens_per_adapter = tokens_per_adapter
 
