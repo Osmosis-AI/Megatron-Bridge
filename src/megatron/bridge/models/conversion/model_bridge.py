@@ -597,6 +597,10 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
         """
         raise NotImplementedError("Subclass must implement mapping_registry method")
 
+    def should_skip_conversion_param(self, global_param_name: str) -> bool:
+        """Return whether a Megatron parameter should be omitted from HF conversion tasks."""
+        return False
+
     def _megatron_global_param_names_all_pp_ranks(
         self, megatron_model: Union[MegatronModel, List[MegatronModel]]
     ) -> List[str]:
@@ -786,6 +790,8 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
         description = f"Loading from {hf_pretrained.model_name_or_path}"
         for task in self._with_progress_tracking(hf_to_megatron_tasks, description):
             # None means megatron module not on current rank, skip if this task is not going to happen
+            if task is None: 
+                continue
             if task.megatron_module is None:
                 continue
             # 1) Fetch source tensor(s) from HF state dict
@@ -1220,6 +1226,9 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
         embeddings_are_tied = self._share_embeddings_and_output_weights(model_config)
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         sorted_global_param_names_all_pp_ranks = self._megatron_global_param_names_all_pp_ranks(megatron_model)
+        sorted_global_param_names_all_pp_ranks = [
+            name for name in sorted_global_param_names_all_pp_ranks if not self.should_skip_conversion_param(name)
+        ]
 
         # Filter out output_layer related parameters if embeddings are tied
         if embeddings_are_tied:
@@ -1238,6 +1247,8 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
 
                 local_name = self._unwrap_name(local_name)
                 global_name = _megatron_local_name_to_global(megatron_model, model_config, local_name, vp_stage)
+                if self.should_skip_conversion_param(global_name):
+                    continue
                 # if name removed due to some reason, continue. e.g. embeddings_are_tied
                 if global_name not in global_names_index_dict:
                     print_rank_0(f"WARNING: {global_name} not in global_names_index_dict")

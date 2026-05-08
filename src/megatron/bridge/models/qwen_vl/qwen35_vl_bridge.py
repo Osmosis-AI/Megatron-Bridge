@@ -66,6 +66,10 @@ _QWEN3_5_DENSE_HF_CLASS_NAME = "Qwen3_5ForConditionalGeneration"
 _QWEN3_5_MOE_HF_CLASS_NAME = "Qwen3_5MoeForConditionalGeneration"
 
 
+def _is_mtp_transformer_param(global_param_name: str) -> bool:
+    return global_param_name.startswith("language_model.mtp.layers.") and ".transformer_layer." in global_param_name
+
+
 @MegatronModelBridge.register_bridge(
     source=_QWEN3_5_MOE_HF_CLASS_NAME,
     target=Qwen3VLModel,
@@ -98,6 +102,9 @@ class Qwen35VLMoEBridge(MegatronModelBridge):
     def __init__(self):
         super().__init__()
         self.hf_weights_cache: Dict[str, Dict[int, torch.Tensor]] = {}
+
+    def should_skip_conversion_param(self, global_param_name: str) -> bool:
+        return _is_mtp_transformer_param(global_param_name)
 
     def maybe_modify_converted_hf_weight(
         self,
@@ -518,6 +525,9 @@ class Qwen35VLBridge(MegatronModelBridge):
         >>> bridge = AutoBridge.from_hf_pretrained("Qwen/Qwen3.5-27B")
         >>> provider = bridge.to_megatron_provider()
     """
+
+    def should_skip_conversion_param(self, global_param_name: str) -> bool:
+        return _is_mtp_transformer_param(global_param_name)
 
     def provider_bridge(self, hf_pretrained: PreTrainedVLM) -> Qwen35VLModelProvider:
         """Create a Qwen35VLModelProvider from a HuggingFace pretrained model."""
