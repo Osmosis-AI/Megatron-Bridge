@@ -41,240 +41,6 @@ from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
 from megatron.bridge.peft.utils import ParallelLinearAdapter, all2all_hp2sp, get_adapter_attributes_from_linear
 
 
-class SimpleLoRAAdapter(nn.Module):
-    """Lightweight LoRA adapter for plain ``nn.Linear`` modules.
-
-    Holds a ``linear_in`` (A) and ``linear_out`` (B) pair with scaling.
-    Unlike :class:`ParallelLinearAdapter`, this has no TP/SP communication.
-    """
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        dim: int = 16,
-        alpha: float = 32.0,
-        dropout: float = 0.0,
-        dropout_position: Literal["pre", "post"] = "pre",
-        lora_A_init_method: str = "xavier",
-        lora_dtype: Optional[torch.dtype] = None,
-        device: Optional[torch.device] = None,
-    ) -> None:
-        super().__init__()
-        self.dim = dim
-        self.alpha = alpha
-
-        dtype = lora_dtype
-        self.linear_in = nn.Linear(in_features, dim, bias=False, dtype=dtype, device=device)
-        self.linear_out = nn.Linear(dim, out_features, bias=False, dtype=dtype, device=device)
-
-        self._init_weights(lora_A_init_method)
-
-        if dropout > 0.0:
-            self.dropout = nn.Dropout(p=dropout)
-        else:
-            self.dropout = nn.Identity()
-        self.dropout_position = dropout_position
-
-    def _init_weights(self, lora_A_init_method: str) -> None:
-        if lora_A_init_method == "xavier":
-            nn.init.xavier_normal_(self.linear_in.weight.data)
-        elif lora_A_init_method == "kaiming":
-            nn.init.kaiming_uniform_(self.linear_in.weight.data, a=math.sqrt(5))
-        else:
-            nn.init.xavier_normal_(self.linear_in.weight.data)
-        nn.init.zeros_(self.linear_out.weight.data)
-
-    def _get_init_fn(self, init_method: str):
-        if init_method == "xavier":
-            return nn.init.xavier_normal_
-        elif init_method == "kaiming":
-            from megatron.bridge.peft.utils import init_method_kaiming_uniform
-            return init_method_kaiming_uniform(math.sqrt(5))
-        elif init_method == "zero":
-            return lambda t: nn.init.constant_(t, 0.0)
-        elif init_method == "normal":
-            from megatron.bridge.peft.utils import init_method_normal
-            return init_method_normal(0.2)
-        raise NotImplementedError(f"Unknown init method: {init_method}")
-
-    def forward(self, x: torch.Tensor, apply_scaling: bool = True) -> torch.Tensor:
-        if self.dropout_position == "pre":
-            x = self.dropout(x)
-        out = self.linear_out(self.linear_in(x))
-        if apply_scaling:
-            out = out * (self.alpha / self.dim)
-        if self.dropout_position == "post":
-            out = self.dropout(out)
-        return out
-
-
-class SimpleMultiLoRALinear(nn.Linear):
-    """Plain ``nn.Linear`` wrapped with *N* concurrent LoRA adapters.
-
-    Extends ``nn.Linear`` (like :class:`LinearAdapter`), copies the original
-    weights, freezes them, and adds N :class:`SimpleLoRAAdapter` instances.
-    Returns a plain tensor — compatible with HF models.
-
-    Args:
-        orig_linear: The original ``nn.Linear`` to adapt.
-        n_adapters: Number of adapter slots.
-        dim: LoRA rank.
-        alpha: LoRA scaling parameter.
-        dropout: Dropout probability.
-        dropout_position: ``'pre'`` or ``'post'``.
-        lora_A_init_method: Init method for the A matrix.
-        lora_dtype: Data type for adapter weights.
-    """
-
-    def __init__(
-        self,
-        orig_linear: nn.Linear,
-        n_adapters: int,
-        dim: int = 16,
-        alpha: float = 32.0,
-        dropout: float = 0.0,
-        dropout_position: Literal["pre", "post"] = "pre",
-        lora_A_init_method: str = "xavier",
-        lora_dtype: Optional[torch.dtype] = None,
-    ) -> None:
-        assert isinstance(orig_linear, nn.Linear)
-        super().__init__(
-            in_features=orig_linear.in_features,
-            out_features=orig_linear.out_features,
-            bias=orig_linear.bias is not None,
-            device=orig_linear.weight.device,
-            dtype=orig_linear.weight.dtype,
-        )
-        self.weight.data.copy_(orig_linear.weight.data)
-        if orig_linear.bias is not None:
-            self.bias.data.copy_(orig_linear.bias.data)
-
-        # Freeze base weights
-        self.weight.requires_grad = False
-        if self.bias is not None:
-            self.bias.requires_grad = False
-
-        self.n_adapters = n_adapters
-        self.column_init_method = lora_A_init_method
-        self.row_init_method = "zero"
-        self._adapter_enabled = True
-        self.tokens_per_adapter: Optional[torch.Tensor] = None
-        self.max_rank = dim
-
-        dtype = lora_dtype or orig_linear.weight.dtype
-        device = orig_linear.weight.device
-        self.alpha_values = torch.ones(n_adapters, dtype=dtype, device=device)
-        self.rank_values = torch.full((n_adapters,), dim, dtype=dtype, device=device)
-        self.adapters = nn.ModuleList([
-            SimpleLoRAAdapter(
-                orig_linear.in_features,
-                orig_linear.out_features,
-                dim=dim,
-                alpha=alpha,
-                dropout=dropout,
-                dropout_position=dropout_position,
-                lora_A_init_method=lora_A_init_method,
-                lora_dtype=dtype,
-                device=orig_linear.weight.device,
-            )
-            for _ in range(n_adapters)
-        ])
-
-    def enable_adapter_layers(self) -> None:
-        self._adapter_enabled = True
-
-    def disable_adapter_layers(self) -> None:
-        self._adapter_enabled = False
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base_out = torch.nn.functional.linear(x, self.weight, self.bias)
-
-        if not self._adapter_enabled:
-            return base_out
-
-        tokens_per_adapter = self.tokens_per_adapter
-        x_flat = x.reshape(-1, x.shape[-1])
-        offsets = tokens_per_adapter.cumsum(dim=0)
-        total = offsets[-1].item()
-        assert total == x_flat.shape[0], (
-            f"tokens_per_adapter sum {total} != token count {x_flat.shape[0]}"
-        )
-
-        adapter_outputs = []
-        prev = 0
-        for i in range(self.n_adapters):
-            cur = offsets[i].item()
-            if cur == prev:
-                prev = cur
-                continue
-            out = self.adapters[i](x_flat[prev:cur], apply_scaling=False)
-            adapter_outputs.append(out)
-            prev = cur
-
-        if not adapter_outputs:
-            return base_out
-
-        adapter_output = torch.cat(adapter_outputs, dim=0)
-
-        scaling = self.alpha_values / self.rank_values
-        per_token_scaling = torch.repeat_interleave(scaling, tokens_per_adapter).unsqueeze(-1)
-        adapter_output = adapter_output * per_token_scaling
-
-        return base_out + adapter_output.reshape(base_out.shape)
-
-    # --- Per-adapter lifecycle (same interface as MultiLoRALinear) ---
-
-    def reset_adapter(self, idx: int) -> None:
-        adapter = self.adapters[idx]
-        adapter._get_init_fn(self.column_init_method)(adapter.linear_in.weight.data)
-        adapter._get_init_fn(self.row_init_method)(adapter.linear_out.weight.data)
-
-    def init_adapter_slot(self, idx: int, rank: int, alpha: float) -> None:
-        """Claim slot ``idx`` for an adapter: bind ``rank``/``alpha`` and apply the rank mask."""
-        assert 0 < rank <= self.max_rank, (
-            f"Adapter rank {rank} must be in (0, {self.max_rank}]"
-        )
-        self.alpha_values[idx] = alpha
-        self.rank_values[idx] = rank
-        self._apply_rank_mask(idx)
-
-    def clear_adapter_slot(self, idx: int) -> None:
-        """Free slot ``idx``: zero alpha, restore max rank, re-init weights."""
-        self.alpha_values[idx] = 0
-        self.rank_values[idx] = self.max_rank
-        self.reset_adapter(idx)
-
-    def _apply_rank_mask(self, idx: int) -> None:
-        """Zero padded rows of A and padded cols of B for slot ``idx``.
-
-        Plain ``nn.Linear``-backed adapters have no TP sharding, so the local
-        cutoff equals the global ``actual_rank`` directly. With both sides
-        zero in the padded region, the autograd chain through the two GEMMs
-        keeps the gradient zero there too — no periodic re-masking needed.
-        """
-        actual_rank = int(self.rank_values[idx].item())
-        if actual_rank >= self.max_rank:
-            return
-        adapter = self.adapters[idx]
-        with torch.no_grad():
-            adapter.linear_in.weight.data[actual_rank:].zero_()
-            adapter.linear_out.weight.data[:, actual_rank:].zero_()
-
-    def named_parameters_for_adapter(self, idx: int) -> Iterator[Tuple[str, nn.Parameter]]:
-        prefix = f"adapters.{idx}."
-        for name, param in self.adapters[idx].named_parameters():
-            yield prefix + name, param
-
-    def state_dict_for_adapter(self, idx: int, prefix: str = "") -> Dict[str, Any]:
-        sd: Dict[str, Any] = {}
-        self.adapters[idx].state_dict(destination=sd, prefix=f"{prefix}adapters.{idx}.")
-        return sd
-
-    def load_adapter(self, idx: int, state_dict: Dict[str, torch.Tensor]) -> None:
-        self.adapters[idx].load_state_dict(state_dict, strict=True)
-
-
 class MultiLoRALinear(AdapterWrapper):
     """Megatron parallel linear wrapped with *N* concurrent LoRA adapters.
 
@@ -481,7 +247,7 @@ class MultiLoRALinear(AdapterWrapper):
 # Standalone functions
 # ==================================================================
 
-_MULTI_LORA_TYPES = (MultiLoRALinear, SimpleMultiLoRALinear)
+_MULTI_LORA_TYPES = (MultiLoRALinear)
 
 
 def _iter_multi_lora_modules(model):
@@ -511,7 +277,6 @@ def init_adapter_slot(model, idx: int, rank: int, alpha: float) -> None:
     over the model — per-slot setup (rank/alpha bookkeeping + rank-mask
     invariant) lives on the layer itself in
     :meth:`MultiLoRALinear.init_adapter_slot` /
-    :meth:`SimpleMultiLoRALinear.init_adapter_slot`.
     """
     for module in _iter_multi_lora_modules(model):
         module.init_adapter_slot(idx, rank, alpha)
@@ -564,7 +329,7 @@ def expose_adapter_slot(model, idx: int):
       that don't contain the slot index, so saving from slot ``A`` and loading into
       slot ``B`` produces matching keys.
 
-    Both ``MultiLoRALinear`` and ``SimpleMultiLoRALinear`` are handled via the
+    ``MultiLoRALinear`` is handled via the
     common ``.adapters`` ModuleList — duck-typed rather than ``isinstance``-checked
     so future multi-LoRA module types are picked up automatically.
     """
@@ -604,8 +369,6 @@ def hide_adapters(model):
         saved = {}
         for m in modules:
             if isinstance(m, MultiLoRALinear) and "adapters" in m._modules:
-                saved[id(m)] = m._modules.pop("adapters")
-            elif isinstance(m, SimpleMultiLoRALinear) and "adapters" in m._modules:
                 saved[id(m)] = m._modules.pop("adapters")
         yield
         for m in modules:

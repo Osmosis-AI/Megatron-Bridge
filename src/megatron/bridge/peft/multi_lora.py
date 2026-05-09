@@ -29,7 +29,7 @@ from megatron.core.transformer.moe.router import TopKRouter
 
 from megatron.bridge.peft.base import PEFT
 from megatron.bridge.peft.module_matcher import ModuleMatcher
-from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear, SimpleMultiLoRALinear
+from megatron.bridge.peft.multi_lora_layers import MultiLoRALinear
 from megatron.bridge.peft.utils import is_expert_linear
 
 logger = logging.getLogger(__name__)
@@ -66,7 +66,7 @@ class MultiLoRA(PEFT, ModuleMatcher):
     lora_dtype: Optional[torch.dtype] = None
 
     def transform(self, module: nn.Module, name: Optional[str] = None, prefix: Optional[str] = None) -> nn.Module:
-        if isinstance(module, (MultiLoRALinear, SimpleMultiLoRALinear)):
+        if isinstance(module, MultiLoRALinear):
             return module
 
         if (ans := self.match(module, name, prefix)) is not None:
@@ -76,19 +76,6 @@ class MultiLoRA(PEFT, ModuleMatcher):
                 return module
             if isinstance(module, TopKRouter):
                 return module
-
-            if isinstance(module, nn.Linear):
-                logger.info(f"Adding multi-lora ({self.n_adapters} adapters) to nn.Linear: {full_name}")
-                return SimpleMultiLoRALinear(
-                    module,
-                    n_adapters=self.n_adapters,
-                    dim=self.dim,
-                    alpha=self.alpha,
-                    dropout=self.dropout,
-                    dropout_position=self.dropout_position,
-                    lora_A_init_method=self.lora_A_init_method,
-                    lora_dtype=self.lora_dtype,
-                )
 
             logger.info(f"Adding multi-lora ({self.n_adapters} adapters) to: {full_name}")
 
