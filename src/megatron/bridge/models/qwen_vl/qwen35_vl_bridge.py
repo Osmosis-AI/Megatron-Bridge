@@ -40,6 +40,8 @@ from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, 
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     ConcatenatedQKVMapping,
+    ExpertGatedMLPMapping,
+    ExpertMLPDownProjMapping as UnmergedExpertMLPDownProjMapping,
     GatedMLPMapping,
     GDNConv1dMapping,
     GDNLinearMappingSeparate,
@@ -50,8 +52,8 @@ from megatron.bridge.models.conversion.param_mapping import (
 from megatron.bridge.models.hf_pretrained.vlm import PreTrainedVLM
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
 from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
-    ExpertMLPDownProjMapping,
-    ExpertMLPGateUpProjMapping,
+    ExpertMLPDownProjMapping as MergedExpertMLPDownProjMapping,
+    ExpertMLPGateUpProjMapping as MergedExpertMLPGateUpProjMapping,
 )
 from megatron.bridge.models.qwen_vl.qwen35_vl_provider import (
     Qwen35VLModelProvider,
@@ -116,19 +118,16 @@ class Qwen35VLMoEBridge(MegatronModelBridge):
             # Not an expert parameter
             return converted_weights_dict
 
-        # Detect if EP gathering was already done by the mapping (e.g., GatedMLPMapping
-        # with is_expert=True calls gather_from_ep_ranks internally). In that case the
-        # dict contains per-expert tensors from ALL EP ranks — just return them directly.
-        if ep_size > 1:
-            expert_ids_in_dict = set()
-            for key in converted_weights_dict:
-                try:
-                    expert_ids_in_dict.add(extract_expert_number_from_param(key))
-                except ValueError:
-                    pass
-            if len(expert_ids_in_dict) > 1:
-                # EP gathering was already done upstream
-                return converted_weights_dict
+        # If the mapping already emitted real per-expert HF names, no additional
+        # synthetic stacking is needed.
+        expert_ids_in_dict = set()
+        for key in converted_weights_dict:
+            try:
+                expert_ids_in_dict.add(extract_expert_number_from_param(key))
+            except ValueError:
+                pass
+        if expert_ids_in_dict:
+            return converted_weights_dict
 
         result = {}
         for key, value in converted_weights_dict.items():
@@ -239,6 +238,18 @@ class Qwen35VLMoEBridge(MegatronModelBridge):
 
         return provider
 
+    def _has_unmerged_expert_weights(self) -> bool:
+        """Detect HF checkpoints that store routed experts as per-expert tensors."""
+        hf_keys = getattr(self, "_hf_keys", None)
+        if hf_keys is None:
+            return False
+
+        has_merged_gate_up = any(".mlp.experts.gate_up_proj" in key for key in hf_keys)
+        if has_merged_gate_up:
+            return False
+
+        return any(".mlp.experts.0.gate_proj.weight" in key for key in hf_keys)
+
     def mapping_registry(self) -> MegatronMappingRegistry:
         """
         Return MegatronMappingRegistry containing parameter mappings for Qwen3.5 VL.
@@ -338,6 +349,30 @@ class Qwen35VLMoEBridge(MegatronModelBridge):
         AutoMapping.register_module_type("SharedExpertMLP", "column")
         AutoMapping.register_module_type("GatedDeltaNet", "column")
 
+        if self._has_unmerged_expert_weights():
+            expert_mappings = [
+                ExpertGatedMLPMapping(
+                    megatron_param="language_model.decoder.layers.*.mlp.experts.linear_fc1.weight*",
+                    gate="model.language_model.layers.*.mlp.experts.*.gate_proj.weight",
+                    up="model.language_model.layers.*.mlp.experts.*.up_proj.weight",
+                ),
+                UnmergedExpertMLPDownProjMapping(
+                    megatron_param="language_model.decoder.layers.*.mlp.experts.linear_fc2.weight*",
+                    hf_param="model.language_model.layers.*.mlp.experts.*.down_proj.weight",
+                ),
+            ]
+        else:
+            expert_mappings = [
+                MergedExpertMLPGateUpProjMapping(
+                    megatron_param="language_model.decoder.layers.*.mlp.experts.linear_fc1.weight*",
+                    hf_param="model.language_model.layers.*.mlp.experts.gate_up_proj",
+                ),
+                MergedExpertMLPDownProjMapping(
+                    megatron_param="language_model.decoder.layers.*.mlp.experts.linear_fc2.weight*",
+                    hf_param="model.language_model.layers.*.mlp.experts.down_proj",
+                ),
+            ]
+
         # =====================================================================
         # Special mappings requiring parameter transformation
         # =====================================================================
@@ -380,16 +415,9 @@ class Qwen35VLMoEBridge(MegatronModelBridge):
                 ),
                 # =============================================================
                 # Language Model: MoE Expert MLPs (routed experts)
-                # Uses GatedMLPMapping for gate+up projection fusion
+                # Uses either real per-expert HF keys or pre-merged expert tensors.
                 # =============================================================
-                ExpertMLPGateUpProjMapping(
-                    megatron_param="language_model.decoder.layers.*.mlp.experts.linear_fc1.weight*",
-                    hf_param="model.language_model.layers.*.mlp.experts.gate_up_proj",
-                ),
-                ExpertMLPDownProjMapping(
-                    megatron_param="language_model.decoder.layers.*.mlp.experts.linear_fc2.weight*",
-                    hf_param="model.language_model.layers.*.mlp.experts.down_proj",
-                ),
+                *expert_mappings,
                 # =============================================================
                 # Language Model: Shared Expert MLPs
                 # =============================================================
