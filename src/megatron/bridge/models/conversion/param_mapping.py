@@ -2212,6 +2212,51 @@ class GatedMLPMapping(MegatronParamMapping[Dict[str, torch.Tensor]]):
         )
 
 
+def _align_weight_to_shape(weight: torch.Tensor, target_shape: torch.Size | Tuple[int, ...], name: str) -> torch.Tensor:
+    """Accept either standard or transposed checkpoint layouts for expert weights."""
+    if tuple(weight.shape) == tuple(target_shape):
+        return weight
+    if weight.ndim == 2 and tuple(weight.t().shape) == tuple(target_shape):
+        return weight.t().contiguous()
+    raise ValueError(f"Unexpected {name} shape {tuple(weight.shape)}; expected {tuple(target_shape)}.")
+
+
+class ExpertGatedMLPMapping(GatedMLPMapping):
+    """Gated expert MLP mapping for checkpoints with per-expert gate/up tensors."""
+
+    def hf_to_megatron(self, hf_weights: Dict[str, torch.Tensor], megatron_module: nn.Module) -> torch.Tensor:
+        normalized_param = self._normalize_expert_param_name(self.megatron_param)
+        _, target_param = get_module_and_param_from_name(megatron_module, normalized_param)
+        full_target_shape = (target_param.shape[0] * self.tp_size, *target_param.shape[1:])
+
+        if full_target_shape[0] % 2 != 0:
+            raise ValueError(f"Expected even fused dim for {self.megatron_param}, got {full_target_shape}.")
+
+        gate_target_shape = (full_target_shape[0] // 2, *full_target_shape[1:])
+        gate = _align_weight_to_shape(hf_weights["gate"], gate_target_shape, "gate")
+        up = _align_weight_to_shape(hf_weights["up"], gate_target_shape, "up")
+        return super().hf_to_megatron({"gate": gate, "up": up}, megatron_module)
+
+
+class ExpertMLPDownProjMapping(AutoMapping):
+    """Expert down projection mapping for checkpoints with per-expert tensors."""
+
+    def hf_to_megatron(self, hf_weights: torch.Tensor, megatron_module: nn.Module) -> torch.Tensor:
+        normalized_param = self._normalize_expert_param_name(self.megatron_param)
+        target_module, target_param = get_module_and_param_from_name(megatron_module, normalized_param)
+        parallelism_type = self._detect_parallelism_type(target_module)
+
+        if parallelism_type == "row" and hf_weights.ndim >= 2:
+            target_shape = (target_param.shape[0], target_param.shape[1] * self.tp_size, *target_param.shape[2:])
+        elif parallelism_type == "column":
+            target_shape = (target_param.shape[0] * self.tp_size, *target_param.shape[1:])
+        else:
+            target_shape = target_param.shape
+
+        hf_weights = _align_weight_to_shape(hf_weights, target_shape, "down_proj")
+        return super().hf_to_megatron(hf_weights, megatron_module)
+
+
 class RMSNorm2ZeroCenteredRMSNormMapping(AutoMapping):
     """
     Mapping for zero-centered RMSNorm to standard RMSNorm.
@@ -2503,6 +2548,8 @@ def merge_gdn_linear_weights(
     )
 
     q, k, v, z, b, a = [weight.reshape(tp_size, -1, hidden_size) for weight in [q, k, v, z, b, a]]
+    dtype = b.dtype
+    q, k, v, z = (x.to(dtype) for x in (q, k, v, z))
     in_proj = torch.cat([q, k, v, z, b, a], dim=1)
     in_proj = in_proj.reshape(-1, hidden_size)
 
